@@ -11,7 +11,7 @@ from typing import Dict, Optional
 
 import argbind
 import torch
-from tensorboardX import SummaryWriter
+# from tensorboardX import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 import signal
@@ -29,13 +29,19 @@ except ImportError:
 from voxcpm.model import VoxCPMModel
 from voxcpm.model.voxcpm import LoRAConfig
 from voxcpm.training import (
-    Accelerator,
+    # Accelerator,
     BatchProcessor,
     TrainingTracker,
     build_dataloader,
     load_audio_text_datasets,
 )
 
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.logging import get_logger
+import json
+
+logger = get_logger(__name__, log_level="INFO")
 
 @argbind.bind(without_prefix=True)
 def train(
@@ -63,6 +69,9 @@ def train(
     # Distribution options (for LoRA checkpoints)
     hf_model_id: str = "",   # HuggingFace model ID (e.g., "openbmb/VoxCPM1.5")
     distribute: bool = False, # If True, save hf_model_id as base_model; otherwise save pretrained_path
+    project_name: str = "voxcpm-finetune",  # NEW: project name for Accelerate
+    deepspeed_config: str = "",  # NEW: path to deepspeed config JSON
+    seed: int = 42,              # NEW: random seed
 ):
     _ = config_path
     
@@ -70,19 +79,34 @@ def train(
     if lora is not None and distribute and not hf_model_id:
         raise ValueError("hf_model_id is required when distribute=True")
     
-    accelerator = Accelerator(amp=True)
+    # accelerator = Accelerator(amp=True)
 
     save_dir = Path(save_path)
-    tb_dir = Path(tensorboard) if tensorboard else save_dir / "logs"
+    # tb_dir = Path(tensorboard) if tensorboard else save_dir / "logs"
+    config = ProjectConfiguration(project_dir=save_path, logging_dir=str(Path(save_path) / "logs"))
+    accelerator = Accelerator(
+        gradient_accumulation_steps=grad_accum_steps,
+        mixed_precision="bf16",  # replaces amp=True
+        project_config=config,
+        log_with="tensorboard",
+        deepspeed_plugin=deepspeed_config if deepspeed_config else None,
+    )
+    
+    # Set seed for reproducibility
+    set_seed(seed)
 
-    # Only create directories on rank 0 to avoid race conditions
-    if accelerator.rank == 0:
+    if accelerator.is_main_process:  # Changed from accelerator.rank == 0
         save_dir.mkdir(parents=True, exist_ok=True)
-        tb_dir.mkdir(parents=True, exist_ok=True)
-    accelerator.barrier()  # Wait for directory creation
+        # tb_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()  # Changed from accelerator.barrier()
 
-    writer = SummaryWriter(log_dir=str(tb_dir)) if accelerator.rank == 0 else None
-    tracker = TrainingTracker(writer=writer, log_file=str(save_dir / "train.log"), rank=accelerator.rank)
+    # Initialize Accelerate's trackers
+    if accelerator.is_main_process:
+        accelerator.init_trackers(project_name, config={
+            "lr": learning_rate, 
+            "batch_size": batch_size,
+            "grad_accum": grad_accum_steps
+        })
 
     base_model = VoxCPMModel.from_local(pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None)
     tokenizer = base_model.text_tokenizer
@@ -126,8 +150,8 @@ def train(
         max_sample_len = max_batch_tokens // batch_size if batch_size > 0 else max(est_lengths)
         keep_indices = [i for i, L in enumerate(est_lengths) if L <= max_sample_len]
 
-        if len(keep_indices) < len(train_ds) and accelerator.rank == 0:
-            tracker.print(
+        if len(keep_indices) < len(train_ds) and accelerator.is_main_process:
+            logger.info(
                 f"Filtering {len(train_ds) - len(keep_indices)} / {len(train_ds)} "
                 f"training samples longer than {max_sample_len} tokens "
                 f"(max_batch_tokens={max_batch_tokens})."
@@ -136,7 +160,7 @@ def train(
 
     train_loader = build_dataloader(
         train_ds,
-        accelerator=accelerator,
+        accelerator=None,
         batch_size=batch_size,
         num_workers=num_workers,
         drop_last=True,
@@ -144,7 +168,7 @@ def train(
     val_loader = (
         build_dataloader(
             val_ds,
-            accelerator=accelerator,
+            accelerator=None,
             batch_size=batch_size,
             num_workers=num_workers,
             drop_last=False,
@@ -162,18 +186,9 @@ def train(
     # Save audio_vae for audio generation
     audio_vae_for_gen = base_model.audio_vae
     del base_model.audio_vae
-    model = accelerator.prepare_model(base_model)
-    unwrapped_model = accelerator.unwrap(model)
-    unwrapped_model.train()
-
-
-    # Only print param info on rank 0 to avoid cluttered output
-    if accelerator.rank == 0:
-        for name, param in model.named_parameters():
-            print(name, param.requires_grad)
 
     optimizer = AdamW(
-        (p for p in model.parameters() if p.requires_grad),
+        (p for p in base_model.parameters() if p.requires_grad),
         lr=learning_rate,
         weight_decay=weight_decay,
     )
@@ -188,18 +203,35 @@ def train(
         num_training_steps=total_training_steps,
     )
 
+    model, optimizer, scheduler, train_loader = accelerator.prepare(
+        base_model, optimizer, scheduler, train_loader
+    )
+    
+    if val_loader is not None:
+        val_loader = accelerator.prepare(val_loader)
+    batch_processor.device = accelerator.device
+    model.train()
+
     # Try to load checkpoint and resume training
     start_step = 0
-    if accelerator.rank == 0:
-        start_step = load_checkpoint(model, optimizer, scheduler, save_dir)
-    # Broadcast start_step to all processes
-    if hasattr(accelerator, 'all_reduce'):
-        start_step_tensor = torch.tensor(start_step, device=accelerator.device)
-        accelerator.all_reduce(start_step_tensor)
-        start_step = int(start_step_tensor.item())
+    resume_dir = Path(save_path) / "latest_state"
+    if resume_dir.exists():
+        try:
+            accelerator.load_state(str(resume_dir))
+            logger.info(f"Loaded state from {resume_dir}")
+            if accelerator.is_main_process:
+                info_path = resume_dir / "custom_checkpoint_info.json"
+                if info_path.exists():
+                    with open(info_path, "r") as f:
+                        start_step = json.load(f).get("step", 0)
+        except Exception as e:
+            logger.warning(f"Failed to load state: {e}")
+    start_step_tensor = torch.tensor(start_step, device=accelerator.device)
+    start_step_tensor = accelerator.reduce(start_step_tensor, reduction="sum")
+    start_step = int(start_step_tensor.item())
     
-    if start_step > 0 and accelerator.rank == 0:
-        tracker.print(f"Resuming training from step {start_step}")
+    if start_step > 0 and accelerator.is_main_process:
+        logger.info(f"Resuming training from step {start_step}")
 
     # Resume tracker for signal handler to read current step
     resume = {"step": start_step}
@@ -240,82 +272,70 @@ def train(
             train_iter = iter(train_loader)
             return next(train_iter)
 
-    with tracker.live():
-        for step in range(start_step, num_iters):
-            # update resume step so signal handler can save current progress
-            resume["step"] = step
-            tracker.step = step
-            optimizer.zero_grad(set_to_none=True)
+    for step in range(start_step, num_iters):
+        # update resume step so signal handler can save current progress
+        resume["step"] = step
+        loss_dict = {}
+        # Use accelerator's gradient accumulation context
+        with accelerator.accumulate(model):
+            batch = get_next_batch()
+            processed = batch_processor(batch)
 
-            # Gradient accumulation: accumulate gradients over micro-batches before optimizer step
-            loss_dict = {}
-            for micro_step in range(grad_accum_steps):
-                batch = get_next_batch()
-                processed = batch_processor(batch)
+            # No need for manual sync context - handled by accelerator.accumulate()
+            with accelerator.autocast():
+                outputs = model(
+                    processed["text_tokens"],
+                    processed["text_mask"],
+                    processed["audio_feats"],
+                    processed["audio_mask"],
+                    processed["loss_mask"],
+                    processed["position_ids"],
+                    processed["labels"],
+                    progress=step / max(1, num_iters),
+                )
 
-                # Only sync gradients on the last micro-batch
-                # Use no_sync() for intermediate steps to reduce communication overhead
-                is_last_micro_step = (micro_step == grad_accum_steps - 1)
-                sync_context = contextlib.nullcontext() if is_last_micro_step else accelerator.no_sync()
+            total_loss = 0.0
+            for key, value in outputs.items():
+                if key.startswith("loss/"):
+                    weight = lambdas.get(key, 1.0)
+                    # No manual division by grad_accum_steps - Accelerator handles this
+                    loss_value = value * weight
+                    total_loss = total_loss + loss_value
+                    loss_dict[key] = value.detach()
 
-                with sync_context:
-                    with accelerator.autocast(dtype=torch.bfloat16):
-                        outputs = model(
-                            processed["text_tokens"],
-                            processed["text_mask"],
-                            processed["audio_feats"],
-                            processed["audio_mask"],
-                            processed["loss_mask"],
-                            processed["position_ids"],
-                            processed["labels"],
-                            progress=step / max(1, num_iters),
-                        )
+            # Use accelerator's backward
+            accelerator.backward(total_loss)
 
-                    total_loss = 0.0
-                    for key, value in outputs.items():
-                        if key.startswith("loss/"):
-                            weight = lambdas.get(key, 1.0)
-                            loss_value = value * weight / grad_accum_steps
-                            total_loss = total_loss + loss_value
-                            # Record raw loss from last micro-batch for logging
-                            loss_dict[key] = value.detach()
-
-                    # Accumulate gradients (normalized by grad_accum_steps)
-                    accelerator.backward(total_loss)
-
-            # After all micro-batches, do unscale / grad_norm / step
-            scaler = getattr(accelerator, "scaler", None)
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            # Use large max_norm to only compute grad_norm without actual clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=1e9)
-
-            accelerator.step(optimizer)
-            accelerator.update()
+            # Clip gradients (DeepSpeed handles this internally if configured)
+            if accelerator.sync_gradients:
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
             scheduler.step()
+            optimizer.zero_grad()
 
-            if step % log_interval == 0 or step == num_iters - 1:
-                loss_values = {k: v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
-                loss_values["lr"] = float(optimizer.param_groups[0]["lr"])
-                # Approximate epoch: seen samples / total samples (considering grad_accum and batch_size)
-                epoch = (step * grad_accum_steps * batch_size) / max(1, num_train_samples)
-                loss_values["epoch"] = float(epoch)
-                loss_values["grad_norm"] = float(grad_norm)
-                tracker.log_metrics(loss_values, split="train")
+        # if step % log_interval == 0 or step == num_iters - 1:
+        if accelerator.sync_gradients and (step % log_interval == 0 or step == num_iters - 1):
+            loss_values = {f"train/{k}": v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
+            loss_values["train/lr"] = float(optimizer.param_groups[0]["lr"])
+            # Approximate epoch: seen samples / total samples (considering grad_accum and batch_size)
+            epoch = (step * grad_accum_steps * batch_size) / max(1, num_train_samples)
+            loss_values["train/epoch"] = float(epoch)
+            # loss_values["grad_norm"] = float(grad_norm)
+            loss_values["train/grad_norm"] = float(grad_norm) if 'grad_norm' in locals() else 0.0
+            accelerator.log(loss_values, step=step)
 
-            if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
-                validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
-                        writer=writer, step=step, val_ds=val_ds, audio_vae=audio_vae_for_gen, 
-                        sample_rate=sample_rate, val_texts=val_texts, tokenizer=tokenizer,
-                        valid_interval=valid_interval)
+        if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
+            validate(accelerator.unwrap_model(model), val_loader, batch_processor, accelerator, None, lambdas,
+                    None, step=step, val_ds=val_ds, audio_vae=audio_vae_for_gen, 
+                    sample_rate=sample_rate, val_texts=val_texts, tokenizer=tokenizer,
+                    valid_interval=valid_interval)
 
-            if (step % save_interval == 0 or step == num_iters - 1) and accelerator.rank == 0:
-                save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute)
+        if step % save_interval == 0 or step == num_iters - 1:
+            save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
 
-    if accelerator.rank == 0:
-        save_checkpoint(model, optimizer, scheduler, save_dir, num_iters, pretrained_path, hf_model_id, distribute)
-    if writer:
-        writer.close()
+    save_checkpoint(model, optimizer, scheduler, save_dir, num_iters, pretrained_path, hf_model_id, distribute, accelerator)
+    accelerator.end_training()
 
 
 def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas, 
@@ -336,18 +356,17 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
             if num_batches >= max_val_batches:
                 break
             processed = batch_processor(batch)
-            with accelerator.autocast(dtype=torch.bfloat16):
-                outputs = model(
-                    processed["text_tokens"],
-                    processed["text_mask"],
-                    processed["audio_feats"],
-                    processed["audio_mask"],
-                    processed["loss_mask"],
-                    processed["position_ids"],
-                    processed["labels"],
-                    progress=0.0,
-                    sample_generate=False,
-                )
+            outputs = model(
+                processed["text_tokens"],
+                processed["text_mask"],
+                processed["audio_feats"],
+                processed["audio_mask"],
+                processed["loss_mask"],
+                processed["position_ids"],
+                processed["labels"],
+                progress=0.0,
+                sample_generate=False,
+            )
             total = 0.0
             for key, value in outputs.items():
                 if key.startswith("loss/"):
@@ -360,41 +379,31 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
     if total_losses:
         # Compute mean total loss
         mean_total_loss = torch.stack(total_losses).mean()
-        accelerator.all_reduce(mean_total_loss)
+        # accelerator.all_reduce(mean_total_loss)
+        mean_total_loss = accelerator.gather(mean_total_loss.unsqueeze(0)).mean()
         
         # Compute mean of each sub-loss
-        val_metrics = {"loss/total": mean_total_loss.item()}
+        val_metrics = {"val/total": mean_total_loss.item()}
         for key, values in sub_losses.items():
             mean_sub_loss = torch.stack(values).mean()
-            accelerator.all_reduce(mean_sub_loss)
-            val_metrics[key] = mean_sub_loss.item()
+            # accelerator.all_reduce(mean_sub_loss)
+            mean_sub_loss = accelerator.gather(mean_sub_loss.unsqueeze(0)).mean()
+            val_metrics[key.replace("loss/", "val/")] = mean_sub_loss.item()
         
-        tracker.log_metrics(val_metrics, split="val")
+        accelerator.log(val_metrics, step=step)
     
     # Generate sample audio for TensorBoard display
-    if writer is not None and val_ds is not None and audio_vae is not None and accelerator.rank == 0:
+    tb_tracker = accelerator.get_tracker("tensorboard")
+    writer = tb_tracker.writer if tb_tracker else None
+    if accelerator.is_main_process and val_ds is not None and audio_vae is not None and writer is not None:
         try:
+            model.audio_vae = audio_vae.to(accelerator.device).float()
             generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
                                  val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
                                  tracker=tracker)
+            model.audio_vae = None
         except Exception as e:
-            tracker.print(f"[Warning] Failed to generate sample audio: {e}")
-            import traceback
-            import io
-            buf = io.StringIO()
-            traceback.print_exc(file=buf)
-            tracker.print(buf.getvalue())
-    else:
-        # Log why audio generation was skipped
-        missing = []
-        if writer is None:
-            missing.append("writer")
-        if val_ds is None:
-            missing.append("val_ds")
-        if audio_vae is None:
-            missing.append("audio_vae")
-        if missing and accelerator.rank == 0:
-            tracker.print(f"[Warning] Skip audio generation: missing {', '.join(missing)}")
+             logger.warning(f"Audio gen failed: {e}")
     
     model.train()
 
@@ -412,34 +421,7 @@ def create_mel_figure(gen_audio_np, gen_mel, sample_rate, step=None, ref_audio_n
     """
     Create mel spectrogram figure: show comparison if reference audio exists, otherwise show generated only
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import librosa.display
-    
-    fmax = sample_rate // 2
-    step_str = f" @ Step {step}" if step is not None else ""
-    
-    if ref_audio_np is not None and ref_mel is not None:
-        # Comparison mode: reference vs generated
-        fig, (ax_ref, ax_gen) = plt.subplots(2, 1, figsize=(12, 8))
-        
-        img_ref = librosa.display.specshow(ref_mel, sr=sample_rate, x_axis='time', y_axis='mel', fmax=fmax, cmap='viridis', ax=ax_ref)
-        ax_ref.set_title(f'Reference (GT) - {len(ref_audio_np)/sample_rate:.2f}s{step_str}', fontsize=10, fontweight='bold', color='#28A745')
-        plt.colorbar(img_ref, ax=ax_ref, format='%+2.0f dB', pad=0.02)
-        
-        img_gen = librosa.display.specshow(gen_mel, sr=sample_rate, x_axis='time', y_axis='mel', fmax=fmax, cmap='viridis', ax=ax_gen)
-        ax_gen.set_title(f'Generated - {len(gen_audio_np)/sample_rate:.2f}s', fontsize=10, fontweight='bold', color='#DC3545')
-        plt.colorbar(img_gen, ax=ax_gen, format='%+2.0f dB', pad=0.02)
-    else:
-        # Single figure mode: show generated only
-        fig, ax = plt.subplots(figsize=(12, 4))
-        img = librosa.display.specshow(gen_mel, sr=sample_rate, x_axis='time', y_axis='mel', fmax=fmax, cmap='viridis', ax=ax)
-        ax.set_title(f'Generated - {len(gen_audio_np)/sample_rate:.2f}s{step_str}', fontsize=11, fontweight='bold')
-        plt.colorbar(img, ax=ax, format='%+2.0f dB', pad=0.02)
-    
-    plt.tight_layout()
-    return fig
+    pass
 
 
 def normalize_audio(audio_np):
@@ -455,11 +437,9 @@ def generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, s
     """Select 2 fixed validation samples, generate audio and log to TensorBoard"""
     import numpy as np
     
-    log = tracker.print if tracker else print
+    # log = tracker.print if tracker else print
     num_samples = min(2, len(val_ds))
-    log(f"[Audio] Starting audio generation for {num_samples} samples at step {step}")
-    
-    unwrapped_model = accelerator.unwrap(model)
+    logger.info(f"[Audio] Starting audio generation for {num_samples} samples at step {step}")
     
     for i in range(num_samples):
         sample = val_ds[i]
@@ -474,26 +454,17 @@ def generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, s
                 if ref_sr != sample_rate:
                     import torchaudio.functional as F
                     ref_audio_np = F.resample(torch.from_numpy(ref_audio_np).unsqueeze(0), ref_sr, sample_rate).squeeze(0).numpy()
-                log(f"[Audio] Loaded reference audio for sample {i}: duration={len(ref_audio_np)/sample_rate:.2f}s")
+                logger.info(f"[Audio] Loaded reference audio for sample {i}: duration={len(ref_audio_np)/sample_rate:.2f}s")
         except Exception as e:
-            log(f"[Warning] Failed to load reference audio: {e}")
+            logger.warning(f"[Warning] Failed to load reference audio: {e}")
         
         try:
-            # Inference setup
-            unwrapped_model.eval()
-            unwrapped_model.to(torch.bfloat16)
-            unwrapped_model.audio_vae = audio_vae.to(torch.float32)
-            
-            log(f"[Audio] Generating sample {i} with text: '{text[:50]}...'")
+            logger.info(f"[Audio] Generating sample {i} with text: '{text[:50]}...'")
             with torch.no_grad():
-                generated = unwrapped_model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0)
-            
-            # Restore training setup
-            unwrapped_model.to(torch.float32)
-            unwrapped_model.audio_vae = None
+                generated = model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0)
             
             if generated is None or len(generated) == 0:
-                log(f"[Warning] Generated audio is empty for sample {i}")
+                logger.warning(f"[Warning] Generated audio is empty for sample {i}")
                 continue
             
             # Process generated audio
@@ -502,99 +473,25 @@ def generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, s
             
             tag = f"val_sample_{i}"
             writer.add_audio(f"{tag}/generated_audio", gen_audio_np, global_step=step, sample_rate=sample_rate)
-            log(f"[Audio] Generated audio for sample {i}: duration={len(gen_audio_np)/sample_rate:.2f}s")
+            logger.info(f"[Audio] Generated audio for sample {i}: duration={len(gen_audio_np)/sample_rate:.2f}s")
             
             # Log reference audio
             if ref_audio_np is not None:
                 writer.add_audio(f"{tag}/reference_audio", normalize_audio(ref_audio_np), global_step=step, sample_rate=sample_rate)
-            
-            # Generate mel spectrogram figure
-            try:
-                mel_gen = compute_mel_spectrogram(gen_audio_np, sample_rate)
-                mel_ref = compute_mel_spectrogram(ref_audio_np, sample_rate) if ref_audio_np is not None else None
-                fig = create_mel_figure(gen_audio_np, mel_gen, sample_rate, step, ref_audio_np, mel_ref)
-                writer.add_figure(f"{tag}/mel_spectrogram", fig, global_step=step)
-                log(f"[Audio] Created mel spectrogram figure for sample {i}")
-            except Exception as e:
-                log(f"[Warning] Failed to create mel spectrogram: {e}")
                 
         except Exception as e:
-            log(f"[Warning] Failed to generate audio for sample {i}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"[Warning] Failed to generate audio for sample {i}: {e}")
 
 
-def load_checkpoint(model, optimizer, scheduler, save_dir: Path):
+def load_checkpoint(model, optimizer, scheduler, save_dir: Path, accelerator):
     """
     Load the latest checkpoint if it exists.
     Returns the step number to resume from, or 0 if no checkpoint found.
     """
-    latest_folder = save_dir / "latest"
-    if not latest_folder.exists():
-        return 0
-    
-    unwrapped = model.module if hasattr(model, "module") else model
-    lora_cfg = unwrapped.lora_config
-    
-    # Load model weights
-    if lora_cfg is not None:
-        # LoRA: load lora_weights
-        lora_weights_path = latest_folder / "lora_weights.safetensors"
-        if not lora_weights_path.exists():
-            lora_weights_path = latest_folder / "lora_weights.ckpt"
-        
-        if lora_weights_path.exists():
-            if lora_weights_path.suffix == ".safetensors":
-                from safetensors.torch import load_file
-                state_dict = load_file(str(lora_weights_path))
-            else:
-                ckpt = torch.load(lora_weights_path, map_location="cpu")
-                state_dict = ckpt.get("state_dict", ckpt)
-            
-            # Load only lora weights
-            unwrapped.load_state_dict(state_dict, strict=False)
-            print(f"Loaded LoRA weights from {lora_weights_path}")
-    else:
-        # Full finetune: load model.safetensors or pytorch_model.bin
-        model_path = latest_folder / "model.safetensors"
-        if not model_path.exists():
-            model_path = latest_folder / "pytorch_model.bin"
-        
-        if model_path.exists():
-            if model_path.suffix == ".safetensors":
-                from safetensors.torch import load_file
-                state_dict = load_file(str(model_path))
-            else:
-                ckpt = torch.load(model_path, map_location="cpu")
-                state_dict = ckpt.get("state_dict", ckpt)
-            
-            unwrapped.load_state_dict(state_dict, strict=False)
-            print(f"Loaded model weights from {model_path}")
-    
-    # Load optimizer state
-    optimizer_path = latest_folder / "optimizer.pth"
-    if optimizer_path.exists():
-        optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
-        print(f"Loaded optimizer state from {optimizer_path}")
-    
-    # Load scheduler state
-    scheduler_path = latest_folder / "scheduler.pth"
-    if scheduler_path.exists():
-        scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
-        print(f"Loaded scheduler state from {scheduler_path}")
-    
-    # Try to infer step from checkpoint folders
-    step_folders = [d for d in save_dir.iterdir() if d.is_dir() and d.name.startswith("step_")]
-    if step_folders:
-        steps = [int(d.name.split("_")[1]) for d in step_folders]
-        resume_step = max(steps)
-        print(f"Resuming from step {resume_step}")
-        return resume_step
-    
-    return 0
+    pass
 
 
-def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pretrained_path: str = None, hf_model_id: str = "", distribute: bool = False):
+def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pretrained_path: str = None, hf_model_id: str = "", distribute: bool = False, accelerator=None):
     """
     Save checkpoint with different strategies for full finetune vs LoRA:
     - Full finetune: save non-vae weights to model.safetensors (or pytorch_model.bin if safetensors unavailable)
@@ -603,21 +500,30 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
     import shutil
     
     save_dir.mkdir(parents=True, exist_ok=True)
-    tag = "latest" if step == 0 else f"step_{step:07d}"
+    tag = "latest_state" if step == 0 else f"step_{step:07d}"
     folder = save_dir / tag
     folder.mkdir(parents=True, exist_ok=True)
     
-    unwrapped = model.module if hasattr(model, "module") else model
-    full_state = unwrapped.state_dict()
+    # unwrapped = model.module if hasattr(model, "module") else model
+    # full_state = unwrapped.state_dict()
+    accelerator.save_state(str(folder))
+
+    # Save custom step info
+    if accelerator.is_main_process:
+        step_info = {"step": step}
+        with open(save_dir / "latest_state" / "custom_checkpoint_info.json", "w") as f:
+            json.dump(step_info, f)
+    # Unwrap model to save additional metadata
+    unwrapped = accelerator.unwrap_model(model)
     lora_cfg = unwrapped.lora_config
     
     if lora_cfg is not None:
-        # LoRA finetune: save only lora_A/lora_B weights
-        state_dict = {k: v for k, v in full_state.items() if "lora_" in k}
-        if SAFETENSORS_AVAILABLE:
-            save_file(state_dict, folder / "lora_weights.safetensors")
-        else:
-            torch.save({"state_dict": state_dict}, folder / "lora_weights.ckpt")
+        # # LoRA finetune: save only lora_A/lora_B weights
+        # state_dict = {k: v for k, v in full_state.items() if "lora_" in k}
+        # if SAFETENSORS_AVAILABLE:
+        #     save_file(state_dict, folder / "lora_weights.safetensors")
+        # else:
+        #     torch.save({"state_dict": state_dict}, folder / "lora_weights.ckpt")
         
         # Save LoRA config and base model path to a separate JSON file
         # If distribute=True, save hf_model_id; otherwise save local pretrained_path
@@ -630,12 +536,12 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
         with open(folder / "lora_config.json", "w", encoding="utf-8") as f:
             json.dump(lora_info, f, indent=2, ensure_ascii=False)
     else:
-        # Full finetune: save non-vae weights to model.safetensors
-        state_dict = {k: v for k, v in full_state.items() if not k.startswith("audio_vae.")}
-        if SAFETENSORS_AVAILABLE:
-            save_file(state_dict, folder / "model.safetensors")
-        else:
-            torch.save({"state_dict": state_dict}, folder / "pytorch_model.bin")
+        # # Full finetune: save non-vae weights to model.safetensors
+        # state_dict = {k: v for k, v in full_state.items() if not k.startswith("audio_vae.")}
+        # if SAFETENSORS_AVAILABLE:
+        #     save_file(state_dict, folder / "model.safetensors")
+        # else:
+        #     torch.save({"state_dict": state_dict}, folder / "pytorch_model.bin")
         
         # Copy config files from pretrained path
         if pretrained_path:
@@ -645,9 +551,6 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
                 src = pretrained_dir / fname
                 if src.exists():
                     shutil.copy2(src, folder / fname)
-    
-    torch.save(optimizer.state_dict(), folder / "optimizer.pth")
-    torch.save(scheduler.state_dict(), folder / "scheduler.pth")
 
     # Update (or create) a `latest` symlink pointing to the most recent checkpoint folder
     latest_link = save_dir / "latest"
