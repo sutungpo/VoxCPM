@@ -32,8 +32,9 @@ from voxcpm.training import (
     # Accelerator,
     BatchProcessor,
     TrainingTracker,
-    build_dataloader,
+    # build_dataloader,
     load_audio_text_datasets,
+    HFVoxCPMDataset,
 )
 
 from accelerate import Accelerator
@@ -160,7 +161,7 @@ def train(
 
     train_loader = build_dataloader(
         train_ds,
-        accelerator=None,
+        accelerator=accelerator,
         batch_size=batch_size,
         num_workers=num_workers,
         drop_last=True,
@@ -168,7 +169,7 @@ def train(
     val_loader = (
         build_dataloader(
             val_ds,
-            accelerator=None,
+            accelerator=accelerator,
             batch_size=batch_size,
             num_workers=num_workers,
             drop_last=False,
@@ -575,6 +576,27 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
         except Exception:
             print(f"Warning: failed to update latest checkpoint link at {latest_link}")
 
+from datasets import Audio, Dataset
+def build_dataloader(
+    hf_dataset: Dataset,
+    *,
+    accelerator,
+    batch_size: int,
+    num_workers: int,
+    drop_last: bool = False,
+) -> torch.utils.data.DataLoader:
+    torch_dataset = HFVoxCPMDataset(hf_dataset)
+    # Standard padding-based batching; Accelerator will attach DistributedSampler if needed.
+
+    return torch.utils.data.DataLoader(
+        torch_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=HFVoxCPMDataset.collate_fn,
+        drop_last=drop_last,
+        pin_memory=True,
+    )
 
 if __name__ == "__main__":
     from voxcpm.training.config import load_yaml_config

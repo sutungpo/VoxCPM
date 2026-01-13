@@ -142,7 +142,7 @@ class HFVoxCPMDataset(TorchDataset):
         is_prompts = [bool(sample.get("is_prompt", False)) for sample in batch]
 
         text_padded = cls.pad_sequences(text_tensors, pad_value=-100)
-        audio_padded = cls.pad_sequences(audio_tensors, pad_value=-100.0)
+        audio_padded = cls.pad_sequences(audio_tensors, pad_value=0.0)
         task_ids = torch.ones(text_padded.size(0), dtype=torch.int32)
 
         return {
@@ -172,6 +172,7 @@ class BatchProcessor:
         self.dataset_cnt = dataset_cnt
         self.audio_vae = audio_vae
         self.audio_vae.to(device)
+        self.audio_vae.eval() 
         self.packer = AudioFeatureProcessingPacker(
             dataset_cnt=dataset_cnt,
             max_len=config.max_length,
