@@ -601,7 +601,6 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
         
         # Save LoRA config and base model path to a separate JSON file
         # If distribute=True, save hf_model_id; otherwise save local pretrained_path
-        import json
         base_model_to_save = hf_model_id if distribute else (str(pretrained_path) if pretrained_path else None)
         lora_info = {
             "base_model": base_model_to_save,
