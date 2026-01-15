@@ -360,7 +360,7 @@ def train(
                     processed["loss_mask"],
                     processed["position_ids"],
                     processed["labels"],
-                    progress=step / max(1, num_iters),
+                    progress=step / max(1, max_steps),
                 )
 
             total_loss = 0.0
