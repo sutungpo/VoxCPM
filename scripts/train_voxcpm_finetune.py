@@ -92,7 +92,8 @@ def train(
     max_time_seconds: int = 0,   # NEW: maximum training time in seconds (0 means no limit)
 ):
     _ = config_path
-    
+    time_callback = MaxTimeCallback(max_time_seconds)
+    time_callback.on_train_begin()
     # Validate distribution options
     if lora is not None and distribute and not hf_model_id:
         raise ValueError("hf_model_id is required when distribute=True")
@@ -368,8 +369,7 @@ def train(
                 sampler.set_epoch(data_epoch)
             train_iter = iter(train_loader)
             return next(train_iter)
-    time_callback = MaxTimeCallback(max_time_seconds)
-    time_callback.on_train_begin()
+
     for step in range(start_step, max_steps):
         # update resume step so signal handler can save current progress
         resume["step"] = step
