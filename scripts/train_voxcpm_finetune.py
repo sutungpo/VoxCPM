@@ -636,7 +636,7 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
                     shutil.copy2(src, folder / fname)
 
     # Update (or create) a `latest` symlink pointing to the most recent checkpoint folder
-    latest_link = save_dir / "latest"
+    latest_link = save_dir / "latest_state"
     try:
         if latest_link.exists() or latest_link.is_symlink():
             # remove existing link or directory
