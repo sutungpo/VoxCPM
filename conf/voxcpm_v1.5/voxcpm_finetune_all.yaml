@@ -15,7 +15,9 @@ warmup_steps: 100
 max_steps: 2000
 max_batch_tokens: 8192  # Example: single batch can have at most 16k tokens, with batch_size=4, each sample can have at most 4096 tokens
 save_path: /path/to/checkpoints/finetune_all
-tensorboard: /path/to/logs/finetune_all
+# tensorboard: /path/to/logs/finetune_all
+log_with: wandb
+wandb_name: voxcpm
 lambdas:
   loss/diff: 1.0
   loss/stop: 1.0

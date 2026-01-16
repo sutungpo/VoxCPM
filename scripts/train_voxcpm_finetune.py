@@ -42,6 +42,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from accelerate.logging import get_logger
 import json
 import gc
+import wandb
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -63,7 +64,8 @@ def train(
     max_steps: int = 100_000,
     max_batch_tokens: int = 0,
     save_path: str = "checkpoints",
-    tensorboard: str = "",
+    log_with: str = "wandb",
+    wandb_name = "voxcpm",
     lambdas: Dict[str, float] = {"loss/diff": 1.0, "loss/stop": 1.0},
     lora: dict = None,
     config_path: str = "",
@@ -89,7 +91,7 @@ def train(
         gradient_accumulation_steps=grad_accum_steps,
         mixed_precision="bf16",  # replaces amp=True
         project_config=config,
-        log_with="tensorboard",
+        log_with=["tensorboard","wandb"] if log_with == "wandb" else ["tensorboard"],
         deepspeed_plugin=deepspeed_config if deepspeed_config else None,
     )
     
@@ -103,11 +105,19 @@ def train(
 
     # Initialize Accelerate's trackers
     if accelerator.is_main_process:
+        init_kwargs={
+            "wandb": {
+                "name": wandb_name,
+                "settings": wandb.Settings(_disable_stats=True)
+            }
+        } if log_with == "wandb" else {}
         accelerator.init_trackers(project_name, config={
             "lr": learning_rate, 
             "batch_size": batch_size,
             "grad_accum": grad_accum_steps
-        })
+            },
+            init_kwargs=init_kwargs
+        )
 
     base_model = VoxCPMModel.from_local(pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None)
     tokenizer = base_model.text_tokenizer
