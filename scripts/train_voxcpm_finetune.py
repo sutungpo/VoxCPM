@@ -44,10 +44,22 @@ import json
 import gc
 import wandb
 import logging
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__, log_level="INFO")
 
+class MaxTimeCallback:
+    def __init__(self, max_time_seconds):
+        self.max_time_seconds = max_time_seconds
+        self.start_time = None
+    
+    def on_train_begin(self):
+        self.start_time = time.time()
+    
+    def should_stop(self):
+        return time.time() - self.start_time > self.max_time_seconds
+    
 @argbind.bind(without_prefix=True)
 def train(
     pretrained_path: str,
@@ -76,7 +88,8 @@ def train(
     distribute: bool = False, # If True, save hf_model_id as base_model; otherwise save pretrained_path
     project_name: str = "voxcpm-finetune",  # NEW: project name for Accelerate
     deepspeed_config: str = "",  # NEW: path to deepspeed config JSON
-    seed: int = 42,              # NEW: random seed
+    seed: int = 42,              # NEW: random seed for reproducibility
+    max_time_seconds: int = 0,   # NEW: maximum training time in seconds (0 means no limit)
 ):
     _ = config_path
     
@@ -205,6 +218,7 @@ def train(
     #   max_sample_len = max_batch_tokens // batch_size
     #   Samples exceeding this length will be dropped
     # ------------------------------------------------------------------ #
+    start_time = time.time()
     if max_batch_tokens and max_batch_tokens > 0:
         from voxcpm.training.data import compute_sample_lengths
 
@@ -224,6 +238,8 @@ def train(
                 f"(max_batch_tokens={max_batch_tokens})."
             )
         train_ds = train_ds.select(keep_indices)
+        end_time = time.time()
+        logger.info(f"Filtering time: {end_time - start_time:.2f} seconds")
 
     train_loader = build_dataloader(
         train_ds,
@@ -352,7 +368,8 @@ def train(
                 sampler.set_epoch(data_epoch)
             train_iter = iter(train_loader)
             return next(train_iter)
-
+    time_callback = MaxTimeCallback(max_time_seconds)
+    time_callback.on_train_begin()
     for step in range(start_step, max_steps):
         # update resume step so signal handler can save current progress
         resume["step"] = step
@@ -394,6 +411,10 @@ def train(
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+
+        if time_callback.should_stop():
+            logger.info(f"Training stopped after {step} steps due to max_time_seconds limit.")
+            break    
 
         # if step % log_interval == 0 or step == num_iters - 1:
         if accelerator.sync_gradients and (step % log_interval == 0 or step == max_steps - 1):
@@ -584,7 +605,8 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
     - LoRA: save only lora weights to lora_weights.safetensors (or lora_weights.ckpt if safetensors unavailable)
     """
     import shutil
-    
+    latest_dir = save_dir / "latest_state"
+    latest_dir.mkdir(parents=True, exist_ok=True)
     save_dir.mkdir(parents=True, exist_ok=True)
     tag = "latest_state" if step == 0 else f"step_{step:07d}"
     folder = save_dir / tag
@@ -597,7 +619,7 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
     # Save custom step info
     if accelerator.is_main_process:
         step_info = {"step": step}
-        with open(save_dir / "latest_state" / "custom_checkpoint_info.json", "w") as f:
+        with open(latest_dir / "custom_checkpoint_info.json", "w") as f:
             json.dump(step_info, f)
     # Unwrap model to save additional metadata
     unwrapped = accelerator.unwrap_model(model)

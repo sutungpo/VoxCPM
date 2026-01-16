@@ -18,6 +18,7 @@ save_path: /path/to/checkpoints/finetune_all
 # tensorboard: /path/to/logs/finetune_all
 log_with: wandb
 wandb_name: voxcpm
+max_time_seconds: 0
 lambdas:
   loss/diff: 1.0
   loss/stop: 1.0
