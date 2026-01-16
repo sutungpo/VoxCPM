@@ -43,7 +43,9 @@ from accelerate.logging import get_logger
 import json
 import gc
 import wandb
+import logging
 
+logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__, log_level="INFO")
 
 @argbind.bind(without_prefix=True)
@@ -316,21 +318,21 @@ def train(
     resume = {"step": start_step}
 
     # Register signal handler to save checkpoint on termination (SIGTERM/SIGINT)
-    def _signal_handler(signum, frame, _model=model, _optim=optimizer, _sched=scheduler, _save_dir=save_dir, _pretrained=pretrained_path, _hf_id=hf_model_id, _dist=distribute, _resume=resume):
-        try:
-            cur_step = int(_resume.get("step", start_step))
-        except Exception:
-            cur_step = start_step
-        print(f"Signal {signum} received. Saving checkpoint at step {cur_step} ...")
-        try:
-            save_checkpoint(_model, _optim, _sched, _save_dir, cur_step, _pretrained, _hf_id, _dist)
-            print("Checkpoint saved. Exiting.")
-        except Exception as e:
-            print(f"Error saving checkpoint on signal: {e}")
-        os._exit(0)
+    # def _signal_handler(signum, frame, _model=model, _optim=optimizer, _sched=scheduler, _save_dir=save_dir, _pretrained=pretrained_path, _hf_id=hf_model_id, _dist=distribute, _resume=resume):
+    #     try:
+    #         cur_step = int(_resume.get("step", start_step))
+    #     except Exception:
+    #         cur_step = start_step
+    #     print(f"Signal {signum} received. Saving checkpoint at step {cur_step} ...")
+    #     try:
+    #         save_checkpoint(_model, _optim, _sched, _save_dir, cur_step, _pretrained, _hf_id, _dist)
+    #         print("Checkpoint saved. Exiting.")
+    #     except Exception as e:
+    #         print(f"Error saving checkpoint on signal: {e}")
+    #     os._exit(0)
 
-    signal.signal(signal.SIGTERM, _signal_handler)
-    signal.signal(signal.SIGINT, _signal_handler)
+    # signal.signal(signal.SIGTERM, _signal_handler)
+    # signal.signal(signal.SIGINT, _signal_handler)
 
     # Manual epoch management instead of itertools.cycle to support DistributedSampler.set_epoch()
     grad_accum_steps = max(int(grad_accum_steps), 1)
@@ -416,7 +418,7 @@ def train(
             gc.collect()
             torch.cuda.empty_cache()
 
-        if step % save_interval == 0 or step == max_steps - 1:
+        if (step % save_interval == 0 and step > start_step) or step == max_steps - 1:
             save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
 
     save_checkpoint(model, optimizer, scheduler, save_dir, max_steps, pretrained_path, hf_model_id, distribute, accelerator)
@@ -634,29 +636,6 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
                 src = pretrained_dir / fname
                 if src.exists():
                     shutil.copy2(src, folder / fname)
-
-    # Update (or create) a `latest` symlink pointing to the most recent checkpoint folder
-    latest_link = save_dir / "latest_state"
-    try:
-        if latest_link.exists() or latest_link.is_symlink():
-            # remove existing link or directory
-            if latest_link.is_dir() and not latest_link.is_symlink():
-                shutil.rmtree(latest_link)
-            else:
-                latest_link.unlink()
-        # Create a symlink pointing to the new folder
-        os.symlink(str(folder), str(latest_link))
-    except Exception:
-        # If symlink creation fails (e.g., on Windows or permission issues), fall back to copying
-        try:
-            if latest_link.exists():
-                if latest_link.is_dir():
-                    shutil.rmtree(latest_link)
-                else:
-                    latest_link.unlink()
-            shutil.copytree(folder, latest_link)
-        except Exception:
-            print(f"Warning: failed to update latest checkpoint link at {latest_link}")
 
 from datasets import Audio, Dataset
 def build_dataloader(
