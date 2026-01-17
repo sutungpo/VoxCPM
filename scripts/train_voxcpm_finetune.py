@@ -37,7 +37,7 @@ from voxcpm.training import (
     HFVoxCPMDataset,
 )
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import ProjectConfiguration, set_seed
 from accelerate.logging import get_logger
 import json
@@ -45,6 +45,7 @@ import gc
 import wandb
 import logging
 import time
+from torch.utils.checkpoint import checkpoint_wrapper
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__, log_level="INFO")
@@ -103,12 +104,15 @@ def train(
     save_dir = Path(save_path)
     # tb_dir = Path(tensorboard) if tensorboard else save_dir / "logs"
     config = ProjectConfiguration(project_dir=save_path, logging_dir=str(Path(save_path) / "logs"))
+    ds_plugin = None
+    if deepspeed_config and deepspeed_config.strip():
+        ds_plugin = DeepSpeedPlugin(hf_ds_config=deepspeed_config)
     accelerator = Accelerator(
         gradient_accumulation_steps=grad_accum_steps,
         mixed_precision="bf16",  # replaces amp=True
         project_config=config,
         log_with=["tensorboard","wandb"] if log_with == "wandb" else ["tensorboard"],
-        deepspeed_plugin=deepspeed_config if deepspeed_config else None,
+        deepspeed_plugin=ds_plugin if ds_plugin else None,
     )
     
     # Set seed for reproducibility
@@ -138,54 +142,26 @@ def train(
     base_model = VoxCPMModel.from_local(pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None)
     tokenizer = base_model.text_tokenizer
 
-    def apply_manual_gradient_checkpointing(model):
-        """
-        Traverses the model to find all Transformer layers and wraps their 
-        forward method with torch.utils.checkpoint.checkpoint.
-        """
-        import torch.utils.checkpoint
-        
-        # Define the wrapper that injects checkpointing logic
-        def get_checkpointed_forward(original_forward):
-            def wrapper(*args, **kwargs):
-                # Only use checkpointing if training and gradients are enabled
-                if not model.training or not torch.is_grad_enabled():
-                    return original_forward(*args, **kwargs)
-
-                # Inner function required by torch.checkpoint
-                # Captures 'kwargs' from the closure since checkpoint only accepts args
-                def run_layer(*input_args):
-                    return original_forward(*input_args, **kwargs)
-
-                # Checkpointing requires at least one input to have requires_grad=True
-                # args[0] is typically 'hidden_states'
-                if args and isinstance(args[0], torch.Tensor):
-                    args[0].requires_grad_(True)
-                
-                # use_reentrant=False is safer for modern PyTorch DDP
-                return torch.utils.checkpoint.checkpoint(
-                    run_layer,
-                    *args,
-                    use_reentrant=False
-                )
-            return wrapper
-
+    def apply_gradient_checkpointing(model):
+        """Apply checkpointing using PyTorch's checkpoint_wrapper"""
         patched_count = 0
-        # Iterate over all sub-modules to find containers with 'layers' (MiniCPMModel)
+        
         for name, module in model.named_modules():
-            # We identify Transformer backbones by the presence of a 'layers' ModuleList
             if hasattr(module, "layers") and isinstance(module.layers, torch.nn.ModuleList):
                 for i, layer in enumerate(module.layers):
-                    # Patch the layer if not already patched
-                    if not hasattr(layer, "_is_patched_for_checkpointing"):
-                        layer._original_forward = layer.forward
-                        layer.forward = get_checkpointed_forward(layer.forward)
-                        layer._is_patched_for_checkpointing = True
+                    if not hasattr(layer, "_is_checkpointed"):
+                        # Wrap the entire layer module
+                        module.layers[i] = checkpoint_wrapper(
+                            layer,
+                            use_reentrant=False,
+                            preserve_rng_state=True
+                        )
+                        module.layers[i]._is_checkpointed = True
                         patched_count += 1
         
         return patched_count
 
-    num_patched = apply_manual_gradient_checkpointing(base_model)
+    num_patched = apply_gradient_checkpointing(base_model)
     logger.info(f"Successfully patched {num_patched} layers for gradient checkpointing.")
     if hasattr(base_model, "fsq_layer"):
         base_model.fsq_layer = base_model.fsq_layer.float()
@@ -334,23 +310,6 @@ def train(
     # Resume tracker for signal handler to read current step
     resume = {"step": start_step}
 
-    # Register signal handler to save checkpoint on termination (SIGTERM/SIGINT)
-    # def _signal_handler(signum, frame, _model=model, _optim=optimizer, _sched=scheduler, _save_dir=save_dir, _pretrained=pretrained_path, _hf_id=hf_model_id, _dist=distribute, _resume=resume):
-    #     try:
-    #         cur_step = int(_resume.get("step", start_step))
-    #     except Exception:
-    #         cur_step = start_step
-    #     print(f"Signal {signum} received. Saving checkpoint at step {cur_step} ...")
-    #     try:
-    #         save_checkpoint(_model, _optim, _sched, _save_dir, cur_step, _pretrained, _hf_id, _dist)
-    #         print("Checkpoint saved. Exiting.")
-    #     except Exception as e:
-    #         print(f"Error saving checkpoint on signal: {e}")
-    #     os._exit(0)
-
-    # signal.signal(signal.SIGTERM, _signal_handler)
-    # signal.signal(signal.SIGINT, _signal_handler)
-
     # Manual epoch management instead of itertools.cycle to support DistributedSampler.set_epoch()
     grad_accum_steps = max(int(grad_accum_steps), 1)
     data_epoch = 0
@@ -380,17 +339,16 @@ def train(
             processed = batch_processor(batch)
 
             # No need for manual sync context - handled by accelerator.accumulate()
-            with accelerator.autocast():
-                outputs = model(
-                    processed["text_tokens"],
-                    processed["text_mask"],
-                    processed["audio_feats"],
-                    processed["audio_mask"],
-                    processed["loss_mask"],
-                    processed["position_ids"],
-                    processed["labels"],
-                    progress=step / max(1, max_steps),
-                )
+            outputs = model(
+                processed["text_tokens"],
+                processed["text_mask"],
+                processed["audio_feats"],
+                processed["audio_mask"],
+                processed["loss_mask"],
+                processed["position_ids"],
+                processed["labels"],
+                progress=step / max(1, max_steps),
+            )
 
             total_loss = 0.0
             for key, value in outputs.items():
@@ -417,7 +375,7 @@ def train(
             break    
 
         # if step % log_interval == 0 or step == num_iters - 1:
-        if accelerator.sync_gradients and (step % log_interval == 0 or step == max_steps - 1):
+        if step % log_interval == 0 or step == max_steps - 1:
             loss_values = {f"train/{k}": v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
             loss_values["train/lr"] = float(optimizer.param_groups[0]["lr"])
             # Approximate epoch: seen samples / total samples (considering grad_accum and batch_size)
@@ -439,7 +397,7 @@ def train(
             gc.collect()
             torch.cuda.empty_cache()
 
-        if (step % save_interval == 0 and step > start_step) or step == max_steps - 1:
+        if step % save_interval == 0 and step > start_step:
             save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
 
     save_checkpoint(model, optimizer, scheduler, save_dir, max_steps, pretrained_path, hf_model_id, distribute, accelerator)
@@ -504,13 +462,20 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
     writer = tb_tracker.writer if tb_tracker else None
     if accelerator.is_main_process and val_ds is not None and audio_vae is not None and writer is not None:
         try:
-            model.audio_vae = audio_vae.to(accelerator.device).float()
-            generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
-                                 val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
-                                 tracker=tracker)
-            model.audio_vae = None
+            with torch.no_grad():
+                model.audio_vae = audio_vae.to(accelerator.device).float()
+                generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
+                                    val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
+                                    tracker=tracker)
+                model.audio_vae = None
+                audio_vae = audio_vae.to("cpu")
         except Exception as e:
-             logger.warning(f"Audio gen failed: {e}")
+            logger.warning(f"Audio generation failed: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+        finally:
+            # Ensure VAE is detached even if error occurs
+            model.audio_vae = None
     
     model.train()
 
@@ -674,7 +639,7 @@ def build_dataloader(
     return torch.utils.data.DataLoader(
         torch_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         collate_fn=HFVoxCPMDataset.collate_fn,
         drop_last=drop_last,
