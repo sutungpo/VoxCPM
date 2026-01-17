@@ -45,7 +45,6 @@ import gc
 import wandb
 import logging
 import time
-from torch.utils.checkpoint import checkpoint_wrapper
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__, log_level="INFO")
@@ -142,8 +141,15 @@ def train(
     base_model = VoxCPMModel.from_local(pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None)
     tokenizer = base_model.text_tokenizer
 
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+        apply_activation_checkpointing,
+        CheckpointImpl
+    )
+
+    # Wrap individual layers
     def apply_gradient_checkpointing(model):
-        """Apply checkpointing using PyTorch's checkpoint_wrapper"""
+        """Apply checkpointing using PyTorch's distributed checkpoint_wrapper"""
         patched_count = 0
         
         for name, module in model.named_modules():
@@ -153,8 +159,7 @@ def train(
                         # Wrap the entire layer module
                         module.layers[i] = checkpoint_wrapper(
                             layer,
-                            use_reentrant=False,
-                            preserve_rng_state=True
+                            checkpoint_impl=CheckpointImpl.NO_REENTRANT  # Same as use_reentrant=False
                         )
                         module.layers[i]._is_checkpointed = True
                         patched_count += 1
