@@ -405,7 +405,7 @@ def train(
         if step % save_interval == 0 and step > start_step:
             save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
 
-    save_checkpoint(model, optimizer, scheduler, save_dir, max_steps, pretrained_path, hf_model_id, distribute, accelerator)
+    save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
     accelerator.end_training()
 
 def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas, 
