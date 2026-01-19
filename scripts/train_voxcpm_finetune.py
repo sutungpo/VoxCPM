@@ -395,7 +395,7 @@ def train(
             # Flush memory before validation
             gc.collect()
             torch.cuda.empty_cache()
-            validate(accelerator.unwrap_model(model), val_loader, batch_processor, accelerator, None, lambdas,
+            validate(model, val_loader, batch_processor, accelerator, None, lambdas,
                     None, step=step, val_ds=val_ds, audio_vae=audio_vae_for_gen, 
                     sample_rate=sample_rate, val_texts=val_texts, tokenizer=tokenizer,
                     valid_interval=valid_interval)
@@ -406,7 +406,7 @@ def train(
         if step % save_interval == 0 and step > start_step:
             save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
 
-    save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
+    save_checkpoint(model, optimizer, scheduler, save_dir, max_steps, pretrained_path, hf_model_id, distribute, accelerator)
     accelerator.end_training()
 
 def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas, 
@@ -465,16 +465,17 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
     
     # Generate sample audio for TensorBoard display
     tb_tracker = accelerator.get_tracker("tensorboard")
-    writer = tb_tracker.writer if tb_tracker else None
+    if accelerator.is_main_process:
+        writer = tb_tracker.writer if tb_tracker else None
     if accelerator.is_main_process and val_ds is not None and audio_vae is not None and writer is not None:
         try:
+            unwrapped_model = accelerator.unwrap_model(model)
             with torch.no_grad():
-                model.audio_vae = audio_vae.to(accelerator.device).float()
-                generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
+                unwrapped_model.audio_vae = audio_vae.to(accelerator.device).float()
+                generate_sample_audio(unwrapped_model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
                                     val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
                                     tracker=tracker)
-                model.audio_vae = None
-                audio_vae = audio_vae.to("cpu")
+                unwrapped_model.audio_vae = None
         except Exception as e:
             logger.warning(f"Audio generation failed: {e}")
             import traceback
