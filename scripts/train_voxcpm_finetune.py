@@ -90,6 +90,7 @@ def train(
     deepspeed_config: str = "",  # NEW: path to deepspeed config JSON
     seed: int = 42,              # NEW: random seed for reproducibility
     max_time_seconds: int = 0,   # NEW: maximum training time in seconds (0 means no limit)
+    resume_dir: str = "",        # NEW: directory to resume training from
 ):
     _ = config_path
     time_callback = MaxTimeCallback(max_time_seconds)
@@ -293,7 +294,7 @@ def train(
 
     # Try to load checkpoint and resume training
     start_step = 0
-    resume_dir = Path(save_path) / "latest_state"
+    resume_dir = Path(resume_dir)
     if resume_dir.exists():
         try:
             accelerator.load_state(str(resume_dir))
@@ -589,7 +590,7 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
     # Save custom step info
     if accelerator.is_main_process:
         step_info = {"step": step}
-        with open(latest_dir / "custom_checkpoint_info.json", "w") as f:
+        with open(folder / "custom_checkpoint_info.json", "w") as f:
             json.dump(step_info, f)
     # Unwrap model to save additional metadata
     unwrapped = accelerator.unwrap_model(model)
@@ -644,7 +645,7 @@ def build_dataloader(
     return torch.utils.data.DataLoader(
         torch_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=num_workers,
         collate_fn=HFVoxCPMDataset.collate_fn,
         drop_last=drop_last,
