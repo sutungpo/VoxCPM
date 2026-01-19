@@ -540,7 +540,8 @@ def generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, s
         try:
             logger.info(f"[Audio] Generating sample {i} with text: '{text[:50]}...'")
             with torch.no_grad():
-                generated = model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0)
+                with accelerator.autocast():
+                    generated = model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0)
             
             if generated is None or len(generated) == 0:
                 logger.warning(f"[Warning] Generated audio is empty for sample {i}")
