@@ -294,8 +294,8 @@ def train(
 
     # Try to load checkpoint and resume training
     start_step = 0
-    resume_dir = Path(resume_dir)
-    if resume_dir.exists():
+    resume_dir = Path(resume_dir) if resume_dir else None
+    if resume_dir and resume_dir.exists():
         try:
             accelerator.load_state(str(resume_dir))
             logger.info(f"Loaded state from {resume_dir}")
