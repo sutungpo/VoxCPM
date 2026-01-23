@@ -377,15 +377,28 @@ def train(
             optimizer.zero_grad()
 
         if time_callback.should_stop():
-            logger.info(f"Training stopped after {step} steps due to max_time_seconds limit.")
-            break    
+            # 1. Calculate effective global batch size
+            # Note: batch_size is per device, so we multiply by num_processes (GPU count)
+            global_batch_size = batch_size * grad_accum_steps * accelerator.num_processes
+            # 2. Calculate total samples processed across all epochs/steps
+            total_samples_seen = (step + 1) * global_batch_size
+            # 3. Calculate metrics
+            total_epochs = total_samples_seen / num_train_samples
+            
+            logger.info(f"Training stopped due to max_time_seconds limit.")
+            logger.info(f"--------------------------------------------------")
+            logger.info(f"Global Step:       {step}")
+            logger.info(f"Total Samples:     {total_samples_seen} / {num_train_samples} (dataset size)")
+            logger.info(f"Epochs Completed:  {total_epochs:.2f}")
+            logger.info(f"--------------------------------------------------")
+            break
 
         # if step % log_interval == 0 or step == num_iters - 1:
         if step % log_interval == 0 or step == max_steps - 1:
             loss_values = {f"train/{k}": v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
             loss_values["train/lr"] = float(optimizer.param_groups[0]["lr"])
             # Approximate epoch: seen samples / total samples (considering grad_accum and batch_size)
-            epoch = (step * grad_accum_steps * batch_size) / max(1, num_train_samples)
+            epoch = (step * grad_accum_steps * batch_size * accelerator.num_processes) / max(1, num_train_samples)
             loss_values["train/epoch"] = float(epoch)
             # loss_values["grad_norm"] = float(grad_norm)
             loss_values["train/grad_norm"] = float(grad_norm) if 'grad_norm' in locals() else 0.0
@@ -463,26 +476,26 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
         
         accelerator.log(val_metrics, step=step)
     
-    # Generate sample audio for TensorBoard display
-    tb_tracker = accelerator.get_tracker("tensorboard")
-    if accelerator.is_main_process:
-        writer = tb_tracker.writer if tb_tracker else None
-    if accelerator.is_main_process and val_ds is not None and audio_vae is not None and writer is not None:
-        try:
-            unwrapped_model = accelerator.unwrap_model(model)
-            with torch.no_grad():
-                unwrapped_model.audio_vae = audio_vae.to(accelerator.device).float()
-                generate_sample_audio(unwrapped_model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
-                                    val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
-                                    tracker=tracker)
-                unwrapped_model.audio_vae = None
-        except Exception as e:
-            logger.warning(f"Audio generation failed: {e}")
-            import traceback
-            logger.warning(traceback.format_exc())
-        finally:
-            # Ensure VAE is detached even if error occurs
-            model.audio_vae = None
+    # # Generate sample audio for TensorBoard display
+    # tb_tracker = accelerator.get_tracker("tensorboard")
+    # if accelerator.is_main_process:
+    #     writer = tb_tracker.writer if tb_tracker else None
+    # if accelerator.is_main_process and val_ds is not None and audio_vae is not None and writer is not None:
+    #     try:
+    #         unwrapped_model = accelerator.unwrap_model(model)
+    #         with torch.no_grad():
+    #             unwrapped_model.audio_vae = audio_vae.to(accelerator.device).float()
+    #             generate_sample_audio(unwrapped_model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
+    #                                 val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
+    #                                 tracker=tracker)
+    #             unwrapped_model.audio_vae = None
+    #     except Exception as e:
+    #         logger.warning(f"Audio generation failed: {e}")
+    #         import traceback
+    #         logger.warning(traceback.format_exc())
+    #     finally:
+    #         # Ensure VAE is detached even if error occurs
+    #         model.audio_vae = None
     
     model.train()
 
