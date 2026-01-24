@@ -453,8 +453,8 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
     max_val_batches = 10
 
     with torch.no_grad():
-        for batch in val_loader:
-            if num_batches >= max_val_batches:
+        for batch_idx, batch in enumerate(val_loader):
+            if batch_idx >= max_val_batches:
                 break
             processed = batch_processor(batch)
             outputs = model(
@@ -476,7 +476,7 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
                     sub_losses[key].append(value.detach())
             total_losses.append(total.detach())
             num_batches += 1
-
+    accelerator.wait_for_everyone()
     if total_losses:
         # Compute mean total loss
         mean_total_loss = torch.stack(total_losses).mean()
@@ -513,7 +513,7 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
     #     finally:
     #         # Ensure VAE is detached even if error occurs
     #         model.audio_vae = None
-    
+    accelerator.wait_for_everyone()
     model.train()
 
 
