@@ -595,11 +595,11 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
     """
     import shutil
     tag = "latest_state" if step == 0 else f"step_{step:07d}"
+    folder = save_dir / tag
     if accelerator.is_main_process:
         latest_dir = save_dir / "latest_state"
         latest_dir.mkdir(parents=True, exist_ok=True)
         save_dir.mkdir(parents=True, exist_ok=True)
-        folder = save_dir / tag
         folder.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
     # unwrapped = model.module if hasattr(model, "module") else model
