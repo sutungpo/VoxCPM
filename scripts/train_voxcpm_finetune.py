@@ -376,21 +376,24 @@ def train(
             scheduler.step()
             optimizer.zero_grad()
 
+        should_stop = torch.tensor(0.0, device=accelerator.device)
         if time_callback.should_stop():
-            # 1. Calculate effective global batch size
-            # Note: batch_size is per device, so we multiply by num_processes (GPU count)
-            global_batch_size = batch_size * grad_accum_steps * accelerator.num_processes
-            # 2. Calculate total samples processed across all epochs/steps
-            total_samples_seen = (step + 1) * global_batch_size
-            # 3. Calculate metrics
-            total_epochs = total_samples_seen / num_train_samples
+            should_stop += 1.0
+        accelerator.reduce(should_stop, reduction="sum")
+        if should_stop.item() > 0:
+            if accelerator.is_main_process:
+                # 1. Calculate metrics (same as before)
+                global_batch_size = batch_size * grad_accum_steps * accelerator.num_processes
+                total_samples_seen = (step + 1) * global_batch_size
+                total_epochs = total_samples_seen / num_train_samples
+                
+                logger.info(f"Training stopped due to max_time_seconds limit.")
+                logger.info(f"--------------------------------------------------")
+                logger.info(f"Global Step:       {step}")
+                logger.info(f"Epochs Completed:  {total_epochs:.2f}")
+                logger.info(f"--------------------------------------------------")
             
-            logger.info(f"Training stopped due to max_time_seconds limit.")
-            logger.info(f"--------------------------------------------------")
-            logger.info(f"Global Step:       {step}")
-            logger.info(f"Total Samples:     {total_samples_seen} / {num_train_samples} (dataset size)")
-            logger.info(f"Epochs Completed:  {total_epochs:.2f}")
-            logger.info(f"--------------------------------------------------")
+            # Important: Break on all ranks
             break
 
         # if step % log_interval == 0 or step == num_iters - 1:
@@ -591,13 +594,14 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
     - LoRA: save only lora weights to lora_weights.safetensors (or lora_weights.ckpt if safetensors unavailable)
     """
     import shutil
-    latest_dir = save_dir / "latest_state"
-    latest_dir.mkdir(parents=True, exist_ok=True)
-    save_dir.mkdir(parents=True, exist_ok=True)
     tag = "latest_state" if step == 0 else f"step_{step:07d}"
-    folder = save_dir / tag
-    folder.mkdir(parents=True, exist_ok=True)
-    
+    if accelerator.is_main_process:
+        latest_dir = save_dir / "latest_state"
+        latest_dir.mkdir(parents=True, exist_ok=True)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        folder = save_dir / tag
+        folder.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
     # unwrapped = model.module if hasattr(model, "module") else model
     # full_state = unwrapped.state_dict()
     accelerator.save_state(str(folder))
@@ -607,43 +611,44 @@ def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pret
         step_info = {"step": step}
         with open(folder / "custom_checkpoint_info.json", "w") as f:
             json.dump(step_info, f)
-    # Unwrap model to save additional metadata
-    unwrapped = accelerator.unwrap_model(model)
-    lora_cfg = unwrapped.lora_config
-    
-    if lora_cfg is not None:
-        # # LoRA finetune: save only lora_A/lora_B weights
-        # state_dict = {k: v for k, v in full_state.items() if "lora_" in k}
-        # if SAFETENSORS_AVAILABLE:
-        #     save_file(state_dict, folder / "lora_weights.safetensors")
-        # else:
-        #     torch.save({"state_dict": state_dict}, folder / "lora_weights.ckpt")
+        # Unwrap model to save additional metadata
+        unwrapped = accelerator.unwrap_model(model)
+        lora_cfg = unwrapped.lora_config
         
-        # Save LoRA config and base model path to a separate JSON file
-        # If distribute=True, save hf_model_id; otherwise save local pretrained_path
-        base_model_to_save = hf_model_id if distribute else (str(pretrained_path) if pretrained_path else None)
-        lora_info = {
-            "base_model": base_model_to_save,
-            "lora_config": lora_cfg.model_dump() if hasattr(lora_cfg, "model_dump") else vars(lora_cfg),
-        }
-        with open(folder / "lora_config.json", "w", encoding="utf-8") as f:
-            json.dump(lora_info, f, indent=2, ensure_ascii=False)
-    else:
-        # # Full finetune: save non-vae weights to model.safetensors
-        # state_dict = {k: v for k, v in full_state.items() if not k.startswith("audio_vae.")}
-        # if SAFETENSORS_AVAILABLE:
-        #     save_file(state_dict, folder / "model.safetensors")
-        # else:
-        #     torch.save({"state_dict": state_dict}, folder / "pytorch_model.bin")
-        
-        # Copy config files from pretrained path
-        if pretrained_path:
-            pretrained_dir = Path(pretrained_path)
-            files_to_copy = ["config.json", "audiovae.pth", "tokenizer.json", "special_tokens_map.json", "tokenizer_config.json"]
-            for fname in files_to_copy:
-                src = pretrained_dir / fname
-                if src.exists():
-                    shutil.copy2(src, folder / fname)
+        if lora_cfg is not None:
+            # # LoRA finetune: save only lora_A/lora_B weights
+            # state_dict = {k: v for k, v in full_state.items() if "lora_" in k}
+            # if SAFETENSORS_AVAILABLE:
+            #     save_file(state_dict, folder / "lora_weights.safetensors")
+            # else:
+            #     torch.save({"state_dict": state_dict}, folder / "lora_weights.ckpt")
+            
+            # Save LoRA config and base model path to a separate JSON file
+            # If distribute=True, save hf_model_id; otherwise save local pretrained_path
+            base_model_to_save = hf_model_id if distribute else (str(pretrained_path) if pretrained_path else None)
+            lora_info = {
+                "base_model": base_model_to_save,
+                "lora_config": lora_cfg.model_dump() if hasattr(lora_cfg, "model_dump") else vars(lora_cfg),
+            }
+            with open(folder / "lora_config.json", "w", encoding="utf-8") as f:
+                json.dump(lora_info, f, indent=2, ensure_ascii=False)
+        else:
+            # # Full finetune: save non-vae weights to model.safetensors
+            # state_dict = {k: v for k, v in full_state.items() if not k.startswith("audio_vae.")}
+            # if SAFETENSORS_AVAILABLE:
+            #     save_file(state_dict, folder / "model.safetensors")
+            # else:
+            #     torch.save({"state_dict": state_dict}, folder / "pytorch_model.bin")
+            
+            # Copy config files from pretrained path
+            if pretrained_path:
+                pretrained_dir = Path(pretrained_path)
+                files_to_copy = ["config.json", "audiovae.pth", "tokenizer.json", "special_tokens_map.json", "tokenizer_config.json"]
+                for fname in files_to_copy:
+                    src = pretrained_dir / fname
+                    if src.exists():
+                        shutil.copy2(src, folder / fname)
+    accelerator.wait_for_everyone()
 
 from datasets import Audio, Dataset
 def build_dataloader(
