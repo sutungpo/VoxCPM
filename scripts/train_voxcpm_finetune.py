@@ -423,7 +423,21 @@ def train(
             save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute, accelerator)
 
     save_checkpoint(model, optimizer, scheduler, save_dir, step+1, pretrained_path, hf_model_id, distribute, accelerator)
-    accelerator.end_training()
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        logger.info("Ending training and closing trackers...")
+    try:
+        accelerator.end_training()
+    except Exception as e:
+        if accelerator.is_main_process:
+            logger.warning(f"Exception during end_training (usually safe to ignore): {e}")
+        if hasattr(accelerator, '_trackers'):
+            for tracker in accelerator._trackers:
+                try:
+                    if hasattr(tracker, 'finish'):
+                        tracker.finish()
+                except:
+                    pass
 
 def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas, 
               writer=None, step=0, val_ds=None, audio_vae=None, sample_rate=22050,
