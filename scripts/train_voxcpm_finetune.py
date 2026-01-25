@@ -376,28 +376,28 @@ def train(
             scheduler.step()
             optimizer.zero_grad()
 
-        should_stop = torch.tensor(0.0, device=accelerator.device)
-        if time_callback.should_stop():
-            should_stop += 1.0
-        accelerator.reduce(should_stop, reduction="sum")
-        if should_stop.item() > 0:
-            if accelerator.is_main_process:
-                # 1. Calculate metrics (same as before)
-                global_batch_size = batch_size * grad_accum_steps * accelerator.num_processes
-                total_samples_seen = (step + 1) * global_batch_size
-                total_epochs = total_samples_seen / num_train_samples
-                
-                logger.info(f"Training stopped due to max_time_seconds limit.")
-                logger.info(f"--------------------------------------------------")
-                logger.info(f"Global Step:       {step}")
-                logger.info(f"Epochs Completed:  {total_epochs:.2f}")
-                logger.info(f"--------------------------------------------------")
-            
-            # Important: Break on all ranks
-            break
-
         # if step % log_interval == 0 or step == num_iters - 1:
         if step % log_interval == 0 or step == max_steps - 1:
+            should_stop = torch.tensor(0.0, device=accelerator.device)
+            if time_callback.should_stop():
+                should_stop += 1.0
+            accelerator.reduce(should_stop, reduction="sum")
+            if should_stop.item() > 0:
+                if accelerator.is_main_process:
+                    # 1. Calculate metrics (same as before)
+                    global_batch_size = batch_size * grad_accum_steps * accelerator.num_processes
+                    total_samples_seen = (step + 1) * global_batch_size
+                    total_epochs = total_samples_seen / num_train_samples
+                    
+                    logger.info(f"Training stopped due to max_time_seconds limit.")
+                    logger.info(f"--------------------------------------------------")
+                    logger.info(f"Global Step:       {step}")
+                    logger.info(f"Epochs Completed:  {total_epochs:.2f}")
+                    logger.info(f"--------------------------------------------------")
+                
+                # Important: Break on all ranks
+                break
+
             loss_values = {f"train/{k}": v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
             loss_values["train/lr"] = float(optimizer.param_groups[0]["lr"])
             # Approximate epoch: seen samples / total samples (considering grad_accum and batch_size)
