@@ -23,6 +23,7 @@ With voice cloning:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import soundfile as sf
@@ -92,7 +93,7 @@ def main():
     args = parse_args()
 
     # Load model from checkpoint directory (no denoiser)
-    print(f"[FT Inference] Loading model: {args.ckpt_dir}")
+    print(f"[FT Inference] Loading model: {args.ckpt_dir}", file=sys.stderr)
     model = VoxCPM.from_pretrained(
         hf_model_id=args.ckpt_dir,
         load_denoiser=False,
@@ -103,10 +104,10 @@ def main():
     prompt_wav_path = args.prompt_audio if args.prompt_audio else None
     prompt_text = args.prompt_text if args.prompt_text else None
 
-    print(f"[FT Inference] Synthesizing: text='{args.text}'")
+    print(f"[FT Inference] Synthesizing: text='{args.text}'", file=sys.stderr)
     if prompt_wav_path:
-        print(f"[FT Inference] Using reference audio: {prompt_wav_path}")
-        print(f"[FT Inference] Reference text: {prompt_text}")
+        print(f"[FT Inference] Using reference audio: {prompt_wav_path}", file=sys.stderr)
+        print(f"[FT Inference] Reference text: {prompt_text}", file=sys.stderr)
 
     audio_np = model.generate(
         text=args.text,
@@ -124,7 +125,10 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(out_path), audio_np, model.tts_model.sample_rate)
 
-    print(f"[FT Inference] Saved to: {out_path}, duration: {len(audio_np) / model.tts_model.sample_rate:.2f}s")
+    print(
+        f"[FT Inference] Saved to: {out_path}, duration: {len(audio_np) / model.tts_model.sample_rate:.2f}s",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
